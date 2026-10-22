@@ -18,7 +18,12 @@ const fmtSize = (bytes) => {
   return `${Math.round((n / 1024 ** i) * 100) / 100} ${u[i]}`;
 };
 
-const FOLDER_RE = /^(?!\/)(?!.*\.\.)[a-zA-Z0-9 ._\-/]*$/;
+// Free system RAM thresholds (GB). Uploads stream in fixed-size chunks, so
+// these don't depend on file size - see runUpload.
+const LOW_MEMORY_WARN_GB = 1;
+const CRITICAL_MEMORY_GB = 0.5;
+
+const FOLDER_RE =/^(?!\/)(?!.*\.\.)[a-zA-Z0-9 ._\-/]*$/;
 
 const STATUS = {
   pending: { tone: 'neutral', icon: null, key: 'statusPending' },
@@ -133,18 +138,18 @@ const UploadPanel = ({ credentials, prefilledIdentifier, onGoToItems }) => {
       return;
     }
 
-    // Large files on a machine already low on RAM is a real way to crash the
-    // app (confirmed via crash dumps: V8's own out-of-memory exception fired
-    // in both the main and renderer processes while a 1.7GB upload was
-    // running with under 5GB free). Warn up front instead of finding out
-    // mid-batch - streaming keeps the app's own footprint low, but the OS,
-    // network stack and everything else on the machine still need headroom.
+    // Warn up front when the machine itself is nearly out of RAM. This is a
+    // flat floor on purpose, not proportional to file size: since uploads
+    // switched to a raw stream piped straight into the socket, the app's own
+    // footprint stays flat whatever the file size (activity.log shows
+    // rss ~170MB / external ~10-20MB through whole 1.7GB uploads). The old
+    // "2x the largest file" rule dated from when axios buffered the whole
+    // body - with it, a 20GB file demanded 40GB free and warned forever.
     try {
       const mem = await window.electronAPI.getMemoryInfo?.();
       if (mem) {
         const freeGB = mem.freeBytes / 1024 ** 3;
-        const largestGB = Math.max(...targets.map((f) => f.size || 0)) / 1024 ** 3;
-        if (freeGB < 3 || freeGB < largestGB * 2) {
+        if (freeGB < LOW_MEMORY_WARN_GB) {
           toast.warning(t('upload.lowMemory', { free: freeGB.toFixed(1) }), { duration: 9000 });
         }
       }
@@ -169,15 +174,13 @@ const UploadPanel = ({ credentials, prefilledIdentifier, onGoToItems }) => {
       // gotten critical, pause and let things settle before risking another
       // transfer instead of finding out via a crash.
       //
-      // Threshold used to be a flat 1GB, which on a machine that normally
-      // idles around 2-4GB free (this one does) almost never triggered
-      // before things were already critical - a large file's own OS/TLS/
-      // network buffering needs real headroom on top of whatever's already
-      // running, proportional to its size, not a fixed floor. Still crashed
-      // on a 1.7GB file with only that flat check in place.
+      // A flat floor again, not size-proportional: the 1.7GB crashes that
+      // once justified "2x the file size" were axios buffering the whole
+      // body, fixed by the raw-stream PUT. A proportional threshold made big
+      // files (10GB+) impossible on an ordinary machine - every one sat
+      // through the full 7.5 minutes of pauses below for nothing.
       try {
-        const fileGB = (file.size || 0) / 1024 ** 3;
-        const criticalGB = Math.max(2, fileGB * 2);
+        const criticalGB = CRITICAL_MEMORY_GB;
         // Re-check after waiting instead of pausing once on a fixed timer
         // and barreling through regardless - a single 20s wait doesn't mean
         // anything actually freed up. Escalate like the archive.org backoff

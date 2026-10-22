@@ -74,6 +74,12 @@ axiosInstance.interceptors.response.use(
   }
 );
 
+const RETRYABLE_ERROR_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ECONNABORTED', 'ECONNREFUSED',
+  'ENETUNREACH', 'ENETDOWN', 'EHOSTUNREACH', 'EAI_AGAIN', 'ENOTFOUND',
+  'ESTALLED' // our own: uploadFileStream's inactivity timeout below
+]);
+
 async function retryOperation(operation, maxRetries = 3, baseDelay = 1000) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
@@ -86,9 +92,12 @@ async function retryOperation(operation, maxRetries = 3, baseDelay = 1000) {
       // much longer, batch-level cooldown instead.
       const isTaskQueueSlowDown = typeof error.response?.data === 'string' &&
         error.response.data.includes('<Code>SlowDown</Code>');
+      // Network-level failures are all worth another go: on a multi-hour
+      // upload of a very large file, a dropped Wi-Fi link or a router hiccup
+      // is close to certain, and failing the whole file over it wastes hours.
       const isRetryable = !isTaskQueueSlowDown && (
-        error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' ||
-        error.response?.status === 503 || error.response?.status === 429
+        RETRYABLE_ERROR_CODES.has(error.code) ||
+        [429, 500, 502, 503, 504].includes(error.response?.status)
       );
 
       if (isLastAttempt || !isRetryable) {
@@ -202,6 +211,20 @@ function sendProgressThrottled(fileName, payload) {
 // different connection lifetimes).
 const uploadAgent = new https.Agent({ rejectUnauthorized: true, keepAlive: true, maxSockets: 4 });
 
+// Uploads run with no overall timeout (a 50GB file on a slow line legitimately
+// takes a day), which also meant a silently dead connection hung forever.
+// Instead: fail only when the socket has been completely idle this long while
+// the body is still being sent, so the retry loop can start over. Once the
+// whole body is out, archive.org can take a while to answer for a very large
+// file (it stores/checksums before replying), so that phase gets far longer.
+const UPLOAD_STALL_MS = 2 * 60 * 1000;
+const UPLOAD_RESPONSE_WAIT_MS = 30 * 60 * 1000;
+
+// Upload retries: more attempts and longer gaps than quick API calls get -
+// 5s, 10s, 20s, 40s, 80s - enough to ride out a short network outage.
+const UPLOAD_MAX_ATTEMPTS = 6;
+const UPLOAD_RETRY_BASE_MS = 5000;
+
 // Raw Node https streaming PUT - deliberately bypasses axios for uploads.
 // A controlled test (throttling a local receiving server to simulate a real
 // upload connection instead of the instant localhost round-trip a naive
@@ -272,7 +295,20 @@ function uploadFileStream({ url, filePath, headers, fileName, onProgress, maxRed
 
       req.on('error', (err) => finish(reject, err));
 
+      let idleLimitMs = UPLOAD_STALL_MS;
+      req.setTimeout(idleLimitMs, () => {
+        const err = new Error(`Upload stalled: no network activity for ${Math.round(idleLimitMs / 1000)}s`);
+        err.code = 'ESTALLED';
+        logActivity(`upload stalled: ${fileName} at ${uploaded} bytes`);
+        req.destroy(err);
+      });
+      fileStream.on('end', () => {
+        idleLimitMs = UPLOAD_RESPONSE_WAIT_MS;
+        req.setTimeout(idleLimitMs);
+      });
+
       req.on('response', (res) => {
+        req.setTimeout(0);
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
           res.resume();
           fileStream.destroy();
@@ -746,7 +782,7 @@ ipcMain.handle('ia:upload', async (event, { identifier, filePath, targetFolder, 
           });
         }
       });
-    });
+    }, UPLOAD_MAX_ATTEMPTS, UPLOAD_RETRY_BASE_MS);
 
     logActivity(`upload done: ${fileName}`);
     forceGc();
@@ -791,7 +827,7 @@ ipcMain.handle('ia:createItem', async (event, { identifier, filePath, accessKey,
           sendProgressThrottled(fileName, { fileName, progress: percentCompleted });
         }
       });
-    });
+    }, UPLOAD_MAX_ATTEMPTS, UPLOAD_RETRY_BASE_MS);
 
     forceGc();
     return { success: true, data: response.data };
